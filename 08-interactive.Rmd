@@ -1,0 +1,21 @@
+```{r setup_interactive, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Interactive applications
+
+## Map visualization
+
+```{r}
+knitr::include_app(url = "https://janimiettinen.shinyapps.io/sleepapneacost/")
+```
+
+- URL: <https://janimiettinen.shinyapps.io/sleepapneacost/>
+
+## Calculator
+
+```{r}
+knitr::include_app(url = "https://janimiettinen.shinyapps.io/sleepapneacalculator/")
+```
+
+- URL: <https://janimiettinen.shinyapps.io/sleepapneacalculator/>
