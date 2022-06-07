@@ -412,6 +412,20 @@ dbDisconnect(con, shutdown=TRUE)
 ### Parquet
 
 ```{r}
+## Delete 3 countries from data
+pop <- pop %>% 
+  filter(!location_name %in% c("San Marino", "Monaco", "Andorra"))
+
+popu_info <- popu_info %>% 
+  filter(!location_name %in% c("San Marino", "Monaco", "Andorra"))
+
+prevalences <- prevalences %>% 
+  filter(!location_name %in% c("San Marino", "Monaco", "Andorra"))
+```
+
+
+
+```{r}
 ## Testing another way to save database only to parquet files
 con = dbConnect(duckdb::duckdb(), dbdir=":MEMORY:", read_only=FALSE)
 ## Register tbls
@@ -445,26 +459,208 @@ fs::file_copy(fils, "/Users/japmiett/projects/sleep22calculator/data/", overwrit
 
 # Data for Visualizer Shiny
 
-```{r, eval=FALSE}
+We need this function for calculating PAF from Odd Ratio. 
 
-## Data without correction ----
-con <- dbConnect(duckdb::duckdb(), dbdir="data/sleep22_calculator.duckdb", read_only=TRUE)
-duckdb::dbListTables(conn = con)
-slapnea22 <- tbl(con, "summary_slapnea_costs") %>% collect()
-dbDisconnect(con, shutdown=TRUE)
+```{r}
+## PAF ODD RATIO formula -----
+## Give only decimals as parameters
+# PD  ## having a disease, prevalence
+# PE  ## exposed, sleep apnea prevalence?
+# PE_ ##  unexposed, 
+paf_or <- function(OR, PD, PE){
+  PD = PD * 100
+  PE = PE * 100
+  PE_ = 100 - PE
+  VALUE1 = (PD * (1 - OR) + PE_ + OR * PE + sqrt( (PD * (1 - OR) + PE_ + OR * PE )^2 - 4 * PE_ * (1 - OR) *PD )) / (2 * PE_ * (1 - OR))
+  VALUE2 = (PD * (1 - OR) + PE_ + OR * PE - sqrt( (PD * (1 - OR) + PE_ + OR * PE )^2 - 4 * PE_ * (1 - OR) *PD )) / (2 * PE_ * (1 - OR))
+  VALUE <- ifelse(VALUE1 < 100 & VALUE1 > 0, VALUE1, VALUE2)
+  PAF = 1 - ((100 * VALUE) / PD)
+  return(PAF)
+}
+
+```
+
+
+## Data Based on Armeni OSA
+
+```{r, eval = FALSE}
+## We need 4 precalculate datasets/values
+## Data for Armeni OSA table and no money index correction
+## Data for Armeni OSA table with money index correction
+## Data for Benjafield OSA table and no money index correction
+## Data for Benjafield OSA table with money index correction
+
+## 1) Data with Armeni OSA table and no money index correction
+prevalences %>% 
+  filter(age_group == "1574") %>% ## TODO Armeni / Benjafield
+  group_by(location_name) %>%
+  mutate(
+    # Select prevalence which to use
+    prevalence = ifelse(is.na(ihme), prevalence_base_italy, ihme), 
+    ## PAF calculation for Risk Ratio or Odds Ratio:
+    # osa_value = osa$rate[osa$gender == "Both" & osa$var == "Moderate-Severe"], ## TODO this needs to be specific  Armeni / Benjafield
+    osa_value = (osa$rate[osa$gender == "Male" & osa$var == "Moderate-Severe"] * pop_male + osa$rate[osa$gender == "Female" & osa$var == "Moderate-Severe"] * pop_female) / pop_both,
+    PAFRR = ifelse(!is.na(RR), (osa_value * (RR - 1) / (osa_value * (RR - 1) + 1)), NA), 
+    PAFOR = ifelse(!is.na(OR), paf_or(OR, prevalence, osa_value), NA),
+    PAF = ifelse(is.na(PAFOR), PAFRR, PAFOR),
+    ## Prevalents per conditions
+    prevalent_cases = prevalence * pop_both, ## Taudin prevalenssi * populaatio, ok
+    prevalent_cases_influenced_osa = PAF * prevalent_cases, ## PAF * prevalent_cases, ok
+    ## Costs per conditions
+    direct_cost = prevalent_cases_influenced_osa * annual_direct_healthcare_cost, ## ok
+    direct_non_healthcare_cost = prevalent_cases_influenced_osa * annual_direct_nonhealthcare_cost, ## ok
+    productivity_lost_cost = prevalent_cases_influenced_osa * annual_productivity_losses_cost, ## ok
+    direct_cost = ifelse(is.na(direct_cost), 0 , direct_cost),
+    direct_non_healthcare_cost = ifelse(is.na(direct_non_healthcare_cost), 0 , direct_non_healthcare_cost),
+    productivity_lost_cost = ifelse(is.na(productivity_lost_cost), 0 , productivity_lost_cost),
+    total_costs = direct_cost + direct_non_healthcare_cost + productivity_lost_cost) -> slapnea_cost1
+## Cpst per patient and sums
+slapnea_cost1 %>% 
+  group_by(location_name, pop_female, pop_male) %>% 
+  summarise(
+    ## Sums of costs
+    direct_cost = sum(direct_cost, na.rm = T),
+    direct_non_healthcare_cost = sum(direct_non_healthcare_cost, na.rm = T),
+    productivity_lost_cost = sum(productivity_lost_cost, na.rm = T)
+    )  %>% 
+  mutate(
+    ## Absolute values for dividing the cost per patient
+    absolute_value_severe_moderate = ( (pop_female * osa$rate[osa$var == "Moderate" & osa$gender == "Female"]) + (pop_female * osa$rate[osa$var == "Severe" & osa$gender == "Female"]) + (pop_male * osa$rate[osa$var == "Moderate" & osa$gender == "Male"]) + (pop_male * osa$rate[osa$var == "Severe" & osa$gender == "Male"])), ## ok
+    # absolute_value_mild = ( pop_female * osa$rate[osa$var == "Mild" & osa$gender == "Female"]) + (pop_male * osa$rate[osa$var == "Mild" & osa$gender == "Male"] ), ## ok
+    ## Costs per patients
+    patient_direct_cost = direct_cost / absolute_value_severe_moderate, ## ok
+    patient_nonhealthcare_cost = direct_non_healthcare_cost / absolute_value_severe_moderate, ## ok
+    patient_productivity_cost = productivity_lost_cost / absolute_value_severe_moderate, ## ok
+    ## Total cost per patient
+    patient_total_cost = patient_direct_cost + patient_nonhealthcare_cost + patient_productivity_cost ## ok
+  ) -> slapnea22
 ## Write to calculation database
 saveRDS(slapnea22, file = "data/slapnea22.RDS")
 
-## EuroStat correction -----
-con <- dbConnect(duckdb::duckdb(), dbdir="data/sleep22_calculator.duckdb", read_only=TRUE)
-slapnea22_eurostat <- tbl(con, "summary_slapnea_costs_corrected") %>% collect()
-dbDisconnect(con, shutdown=TRUE)
+# View(slapnea_cost2[, c("location_name", "patient_total_cost")])
+# Results: costs are almost right, 50 - 100 difference. WHYYYY???
+
+slapnea22 %>% 
+  left_join(money_correction, by = "location_name") %>% 
+  mutate(
+    index= ifelse(is.na(index), 1, index),
+    direct_cost = direct_cost * index,
+    direct_non_healthcare_cost = direct_non_healthcare_cost * index,
+    productivity_lost_cost = productivity_lost_cost * index,
+    total_cost = direct_cost + direct_non_healthcare_cost +productivity_lost_cost,
+    ## Per patient
+    patient_direct_cost = direct_cost / absolute_value_severe_moderate, ## ok
+    patient_nonhealthcare_cost = direct_non_healthcare_cost / absolute_value_severe_moderate, ## ok
+    patient_productivity_cost = productivity_lost_cost / absolute_value_severe_moderate, ## ok
+    patient_total_cost = patient_direct_cost + patient_nonhealthcare_cost + patient_productivity_cost ## ok
+  ) -> slapnea22_eurostat
 ## Write to calculation database
 saveRDS(slapnea22_eurostat, file = "data/slapnea22_eurostat.RDS")
 
 
-## Data for map -----
+# ## Make money correction
+# if(input$money_index == "EuroStat '19"){
+#   dplot <- dplot %>%
+#     left_join(money_correction, by = "location_name") %>%
+#     mutate(corrected = ifelse(is.na(index), FALSE, TRUE),
+#            index = ifelse(is.na(index), 1, index),
+#            direct_cost = direct_cost * index,
+#            direct_non_healthcare_cost = direct_non_healthcare_cost * index,
+#            productivity_lost_cost = productivity_lost_cost * index,
+#            total_costs = total_costs * index)
+# }
 
+```
+
+## Data based on Benjafield OSA prevalence
+
+```{r}
+## Data for Benjafield OSA table and no money index correction
+## Data for Benjafield OSA table with money index correction
+
+## Missä kohtaa laskennassa käytetään uniapnean prevalenssia?
+
+## 1) Data with Armeni OSA table and no money index correction
+## Delete   "San Marino" "Monaco"     "Andorra"
+prevalences <- prevalences %>% 
+  filter(!location_name %in% c("San Marino", "Monaco", "Andorra"))
+
+prevalences %>% 
+  filter(age_group == "3069") %>% ##  Benjafield POP
+  group_by(location_name) %>%
+  mutate(
+    # Select prevalence which to use
+    prevalence = ifelse(is.na(ihme), prevalence_base_italy, ihme), 
+    ## PAF calculation for Risk Ratio or Odds Ratio:
+    ## TODO how  to make this connection in tidyverse?????
+    ## "San Marino" "Monaco"     "Andorra"  are missing from osanew. This needs to be fixed also in shinyapp!
+    ## Add these manually, italy values.
+    # osa_value = osa$rate[osa$gender == "Both" & osa$var == "Moderate-Severe"], ## TODO this needs to be specific  Armeni / Benjafield
+    osa_value = (osanew$rate[osanew$gender == "Male" & osanew$var == "Moderate-Severe" & osanew$location_name == location_name] * pop_male + osanew$rate[osanew$gender == "Female" & osanew$var == "Moderate-Severe" & osanew$location_name == location_name] * pop_female) / pop_both,
+    PAFRR = ifelse(!is.na(RR), (osa_value * (RR - 1) / (osa_value * (RR - 1) + 1)), NA), 
+    PAFOR = ifelse(!is.na(OR), paf_or(OR, prevalence, osa_value), NA),
+    PAF = ifelse(is.na(PAFOR), PAFRR, PAFOR),
+    ## Prevalents per conditions
+    prevalent_cases = prevalence * pop_both, ## Taudin prevalenssi * populaatio, ok
+    prevalent_cases_influenced_osa = PAF * prevalent_cases, ## PAF * prevalent_cases, ok
+    ## Costs per conditions
+    direct_cost = prevalent_cases_influenced_osa * annual_direct_healthcare_cost, ## ok
+    direct_non_healthcare_cost = prevalent_cases_influenced_osa * annual_direct_nonhealthcare_cost, ## ok
+    productivity_lost_cost = prevalent_cases_influenced_osa * annual_productivity_losses_cost, ## ok
+    direct_cost = ifelse(is.na(direct_cost), 0 , direct_cost),
+    direct_non_healthcare_cost = ifelse(is.na(direct_non_healthcare_cost), 0 , direct_non_healthcare_cost),
+    productivity_lost_cost = ifelse(is.na(productivity_lost_cost), 0 , productivity_lost_cost),
+    total_costs = direct_cost + direct_non_healthcare_cost + productivity_lost_cost) -> slapnea_cost1
+
+## Cost per patient and sums
+slapnea_cost1 %>% 
+  group_by(location_name, pop_female, pop_male) %>% 
+  summarise(
+    ## Sums of costs
+    direct_cost = sum(direct_cost, na.rm = T),
+    direct_non_healthcare_cost = sum(direct_non_healthcare_cost, na.rm = T),
+    productivity_lost_cost = sum(productivity_lost_cost, na.rm = T)
+    )  %>% 
+  mutate(
+    ## Absolute values for dividing the cost per patient
+    absolute_value_severe_moderate = ( (pop_female * osanew$rate[osanew$var == "Moderate" & osanew$gender == "Female" & osanew$location_name == location_name]) + (pop_female * osanew$rate[osanew$var == "Severe" & osanew$gender == "Female" & osanew$location_name == location_name]) + (pop_male * osanew$rate[osanew$var == "Moderate" & osanew$gender == "Male" & osanew$location_name == location_name]) + (pop_male * osanew$rate[osanew$var == "Severe" & osanew$gender == "Male" & osanew$location_name == location_name])), ## ok
+    # absolute_value_mild = ( pop_female * osa$rate[osa$var == "Mild" & osa$gender == "Female"]) + (pop_male * osa$rate[osa$var == "Mild" & osa$gender == "Male"] ), ## ok
+    ## Costs per patients
+    patient_direct_cost = direct_cost / absolute_value_severe_moderate, ## ok
+    patient_nonhealthcare_cost = direct_non_healthcare_cost / absolute_value_severe_moderate, ## ok
+    patient_productivity_cost = productivity_lost_cost / absolute_value_severe_moderate, ## ok
+    ## Total cost per patient
+    patient_total_cost = patient_direct_cost + patient_nonhealthcare_cost + patient_productivity_cost ## ok
+  ) -> slapnea22
+## Write to calculation database
+saveRDS(slapnea22, file = "data/slapnea22.RDS")
+
+# View(slapnea_cost2[, c("location_name", "patient_total_cost")])
+# Results: costs are almost right, 50 - 100 difference. WHYYYY???
+
+slapnea22 %>% 
+  left_join(money_correction, by = "location_name") %>% 
+  mutate(
+    index= ifelse(is.na(index), 1, index),
+    direct_cost = direct_cost * index,
+    direct_non_healthcare_cost = direct_non_healthcare_cost * index,
+    productivity_lost_cost = productivity_lost_cost * index,
+    total_cost = direct_cost + direct_non_healthcare_cost +productivity_lost_cost,
+    ## Per patient
+    patient_direct_cost = direct_cost / absolute_value_severe_moderate, ## ok
+    patient_nonhealthcare_cost = direct_non_healthcare_cost / absolute_value_severe_moderate, ## ok
+    patient_productivity_cost = productivity_lost_cost / absolute_value_severe_moderate, ## ok
+    patient_total_cost = patient_direct_cost + patient_nonhealthcare_cost + patient_productivity_cost ## ok
+  ) -> slapnea22_eurostat
+## Write to calculation database
+saveRDS(slapnea22_eurostat, file = "data/slapnea22_eurostat.RDS")
+
+```
+
+## Map data
+
+```{r}
+## Data for map
 # Read this shape file with the rgdal library. 
 library(rgdal)
 world_spdf <- readOGR( 
@@ -491,9 +687,11 @@ countries[!countries %in% europe_spdf$NAME]
 
 ## Write to calculation database
 saveRDS(europe_spdf, file = "data/europe_spdf.RDS")
+```
 
-# slapnea22_eurostat <- sp::merge(europe_spdf, d1, by.x="NAME", by.y="location_name")
+## Save and copy data
 
+```{r, eval=FALSE}
 ## Copy to sleep22visualizer
 fils <- c(paste0(here::here(), "/data/europe_spdf.RDS"), paste0(here::here(), "/data/slapnea22.RDS"), paste0(here::here(), "/data/slapnea22_eurostat.RDS"))
 fs::file_copy(fils, "/Users/japmiett/projects/sleep22visualizer/data/", overwrite = T)
